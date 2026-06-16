@@ -180,7 +180,7 @@ client.on('interactionCreate', async (interaction) => {
 
   // /setup
   if (interaction.isChatInputCommand() && interaction.commandName === 'setup') {
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.ManageChannels))
+    if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageChannels))
       return interaction.reply({ content: '❌ You need Manage Channels permission.', ephemeral: true });
 
     const embed = new EmbedBuilder()
