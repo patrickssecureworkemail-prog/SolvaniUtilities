@@ -188,12 +188,13 @@ client.on('interactionCreate', async (interaction) => {
       .setTitle('🌺 Solvani Support')
       .setColor(CONFIG.COLOR)
       .setDescription(
-        '*Aloha!* Welcome to **Solvani Utilities** — your one-stop support center.\n\n' +
-        'Our team is here to assist you with any questions or concerns. Please select the type of support you need below.\n\n' +
-        '🌿 **General Support** — Questions, guidance, and general assistance.\n' +
-        '📋 **Report** — Report a player, staff member, or rule violation.\n' +
-        '📡 **Communications** — Partnerships, collaborations, and external outreach.\n\n' +
-        '*Thank you for reaching out — we appreciate you!* 🌺'
+        '*🌺 Aloha!*\n' +
+        '**Our team** is here to assist you with **any** questions or concerns!\n' +
+        'Please select the **type of support** you need below.\n\n' +
+        '❓ **General Support:** Questions, support, and general assistance.\n' +
+        '📋 **Report:** Report a player, staff member, or rule violation.\n' +
+        '🎉 **Communications:** Partnerships, Events, and Social Media questions.\n\n' +
+        '**Thank you** for making our **community** better. 🌺'
       )
       .setFooter({ text: 'Solvani Utilities • Support System' })
       .setTimestamp();
