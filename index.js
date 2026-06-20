@@ -177,6 +177,7 @@ async function closeTicket(channel, closedBy, guild) {
 
 // ─── INTERACTIONS ─────────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
+ try {
 
   // /setup
   if (interaction.isChatInputCommand() && interaction.commandName === 'setup') {
@@ -201,7 +202,11 @@ client.on('interactionCreate', async (interaction) => {
       new ButtonBuilder().setCustomId('open_ticket').setLabel('📩 Open a Ticket').setStyle(ButtonStyle.Primary)
     );
 
-    await interaction.channel.send({ embeds: [embed], components: [row] });
+    const setupChannel = interaction.channel ?? await interaction.client.channels.fetch(interaction.channelId);
+    if (!setupChannel) {
+      return interaction.reply({ content: '❌ I could not access this channel. Please check my permissions (View Channel, Send Messages) here.', ephemeral: true });
+    }
+    await setupChannel.send({ embeds: [embed], components: [row] });
     await interaction.reply({ content: '✅ Support panel posted!', ephemeral: true });
   }
 
@@ -224,7 +229,13 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isStringSelectMenu() && interaction.customId === 'select_ticket_type') {
     const type = interaction.values[0];
     const ticketType = TICKET_TYPES[type];
-    const { guild, member } = interaction;
+
+    const guild = interaction.guild ?? await interaction.client.guilds.fetch(interaction.guildId).catch(() => null);
+    const member = interaction.member ?? (guild ? await guild.members.fetch(interaction.user.id).catch(() => null) : null);
+
+    if (!guild || !member) {
+      return interaction.reply({ content: '❌ Something went wrong reading your account info. Please try again.', ephemeral: true });
+    }
 
     for (const [, t] of activeTickets) {
       if (t.userId === member.id)
@@ -280,7 +291,9 @@ client.on('interactionCreate', async (interaction) => {
 
   // Claim button
   if (interaction.isButton() && interaction.customId === 'claim_ticket') {
-    const ticket = activeTickets.get(interaction.channel.id);
+    const ticketChannel = interaction.channel ?? await interaction.client.channels.fetch(interaction.channelId).catch(() => null);
+    if (!ticketChannel) return interaction.reply({ content: '❌ Could not access this channel.', ephemeral: true });
+    const ticket = activeTickets.get(ticketChannel.id);
     if (!ticket) return interaction.reply({ content: '❌ Invalid ticket.', ephemeral: true });
     if (!hasSupportRole(interaction.member)) return interaction.reply({ content: '❌ You do not have permission.', ephemeral: true });
 
@@ -379,6 +392,17 @@ client.on('interactionCreate', async (interaction) => {
       .setTimestamp();
     await interaction.reply({ embeds: [embed] });
   }
+
+ } catch (err) {
+  console.error('❌ Interaction error:', err);
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: '❌ Something went wrong processing that. Please try again or contact an admin.' }).catch(() => {});
+    } else {
+      await interaction.reply({ content: '❌ Something went wrong processing that. Please try again or contact an admin.', ephemeral: true }).catch(() => {});
+    }
+  } catch {}
+ }
 });
 
 client.login(process.env.TOKEN);
