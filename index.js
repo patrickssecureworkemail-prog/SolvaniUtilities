@@ -302,9 +302,20 @@ client.once('ready', async () => {
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
   try {
     await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-    console.log('✅ Slash commands registered.');
+    console.log('✅ Slash commands registered globally.');
   } catch (err) {
-    console.error('❌ Failed to register commands:', err);
+    console.error('❌ Failed to register global commands:', err);
+  }
+
+  // Also register per-guild for instant updates (bypasses global propagation delay)
+  try {
+    const guilds = await client.guilds.fetch();
+    for (const [guildId] of guilds) {
+      await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: commands });
+    }
+    console.log(`✅ Slash commands registered instantly to ${guilds.size} guild(s).`);
+  } catch (err) {
+    console.error('❌ Failed to register guild commands:', err);
   }
 });
 
