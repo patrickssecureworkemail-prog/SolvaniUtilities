@@ -13,6 +13,7 @@ const {
   REST,
   Routes,
 } = require('discord.js');
+const { Pool } = require('pg');
 
 const client = new Client({
   intents: [
@@ -36,6 +37,153 @@ const CONFIG = {
   COLOR: 0xF4C542,
 };
 
+// ─── LEVELING CONFIG ─────────────────────────────────────────────────────────
+const LEVEL_CONFIG = {
+  LEVELS_CHANNEL: process.env.LEVELS_CHANNEL,
+  ADD_MESSAGES_ROLE: process.env.ADD_MESSAGES_ROLE,
+  COOLDOWN_MS: 3000,
+};
+
+// Tiers in ascending order — threshold = messages needed to REACH this tier
+const TIERS = [
+  {
+    key: 'newbie',
+    roleId: process.env.ROLE_NEWBIE,
+    threshold: 0,
+    title: '🌱 Level Up — Newbie In The House',
+    message: (mention) => `Congrats ${mention} on **Newbie**! You're getting there!`,
+  },
+  {
+    key: 'regular',
+    roleId: process.env.ROLE_REGULAR,
+    threshold: 51,
+    title: '🌿 Level Up — Regular In The House',
+    message: (mention) => `Congrats ${mention} on **Regular**! Welcome to the club!`,
+  },
+  {
+    key: 'experienced_regular',
+    roleId: process.env.ROLE_EXPERIENCED_REGULAR,
+    threshold: 201,
+    title: '🌺 Level Up — Experienced Regular In The House',
+    message: (mention) => `Congrats ${mention} on **Experienced Regular**! Thanks for the activity!`,
+  },
+  {
+    key: 'solvani_veteran',
+    roleId: process.env.ROLE_SOLVANI_VETERAN,
+    threshold: 501,
+    title: '🏆 Level Up — Solvani Veteran In The House',
+    message: (mention) => `Congrats ${mention} on **Solvani Veteran**! Thank you for service yapping.`,
+  },
+  {
+    key: 'solvani_legend',
+    roleId: process.env.ROLE_SOLVANI_LEGEND,
+    threshold: 1001,
+    title: '👑 Level Up',
+    message: (mention) => `Congrats ${mention} on **Solvani Legend**! Someone likes to talk… 👀`,
+  },
+];
+
+function getTierForCount(count) {
+  let result = TIERS[0];
+  for (const tier of TIERS) {
+    if (count >= tier.threshold) result = tier;
+  }
+  return result;
+}
+
+function getTierIndex(key) {
+  return TIERS.findIndex(t => t.key === key);
+}
+
+// ─── DATABASE (Postgres) ─────────────────────────────────────────────────────
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false,
+});
+
+async function initDb() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS user_messages (
+      user_id TEXT PRIMARY KEY,
+      message_count INTEGER NOT NULL DEFAULT 0,
+      current_tier TEXT NOT NULL DEFAULT 'newbie'
+    );
+  `);
+  console.log('✅ Database ready.');
+}
+
+async function getUserData(userId) {
+  const res = await db.query('SELECT * FROM user_messages WHERE user_id = $1', [userId]);
+  if (res.rows.length === 0) {
+    await db.query('INSERT INTO user_messages (user_id) VALUES ($1)', [userId]);
+    return { user_id: userId, message_count: 0, current_tier: 'newbie' };
+  }
+  return res.rows[0];
+}
+
+async function incrementMessageCount(userId, amount = 1) {
+  const res = await db.query(
+    `INSERT INTO user_messages (user_id, message_count, current_tier)
+     VALUES ($1, $2, 'newbie')
+     ON CONFLICT (user_id) DO UPDATE SET message_count = user_messages.message_count + $2
+     RETURNING *`,
+    [userId, amount]
+  );
+  return res.rows[0];
+}
+
+async function setUserTier(userId, tierKey) {
+  await db.query('UPDATE user_messages SET current_tier = $1 WHERE user_id = $2', [tierKey, userId]);
+}
+
+// Per-user cooldown tracker (in-memory, resets on restart — fine since it's just a spam guard)
+const messageCooldowns = new Map();
+
+// Handles role swap + announcement when a user crosses into a new tier
+async function checkAndApplyTierUp(member, userData) {
+  const newTier = getTierForCount(userData.message_count);
+  const oldTierIndex = getTierIndex(userData.current_tier);
+  const newTierIndex = getTierIndex(newTier.key);
+
+  if (newTierIndex <= oldTierIndex) return; // no tier change
+
+  // Remove old tier role (if any), add new tier role
+  const oldTier = TIERS[oldTierIndex];
+  if (oldTier?.roleId && member.roles.cache.has(oldTier.roleId)) {
+    await member.roles.remove(oldTier.roleId).catch(() => {});
+  }
+  if (newTier.roleId) {
+    await member.roles.add(newTier.roleId).catch(() => {});
+  }
+
+  await setUserTier(member.id, newTier.key);
+
+  // Announce in #levels
+  const levelsChannel = member.guild.channels.cache.get(LEVEL_CONFIG.LEVELS_CHANNEL)
+    ?? await member.client.channels.fetch(LEVEL_CONFIG.LEVELS_CHANNEL).catch(() => null);
+
+  if (levelsChannel) {
+    const embed = new EmbedBuilder()
+      .setColor(0xF4C542)
+      .setTitle(newTier.title)
+      .setDescription(newTier.message(`<@${member.id}>`))
+      .setTimestamp();
+    await levelsChannel.send({ content: `<@${member.id}>`, embeds: [embed] }).catch(() => {});
+  }
+}
+
+// Silently reassigns a user's earned tier role on rejoin (no announcement)
+async function reassignTierOnRejoin(member) {
+  const userData = await getUserData(member.id);
+  const tier = getTierForCount(userData.message_count);
+  if (tier.roleId && !member.roles.cache.has(tier.roleId)) {
+    await member.roles.add(tier.roleId).catch(() => {});
+  }
+  if (userData.current_tier !== tier.key) {
+    await setUserTier(member.id, tier.key);
+  }
+}
+
 // ─── TICKET TYPES ─────────────────────────────────────────────────────────────
 const TICKET_TYPES = {
   general: {
@@ -58,7 +206,36 @@ const TICKET_TYPES = {
   },
 };
 
-// ─── TAGS ─────────────────────────────────────────────────────────────────────
+// ─── TICKET STATUS EMOJIS ───────────────────────────────────────────────────
+const STATUS_EMOJI = {
+  open: '🟢',
+  claimed: '🟡',
+  priority: '🔴',
+  inactive: '🟣',
+  needs_admin: '⚫',
+  hold: '⚪',
+};
+
+// Strips any existing status emoji prefix off a channel name
+function stripStatusPrefix(name) {
+  const emojis = Object.values(STATUS_EMOJI);
+  for (const e of emojis) {
+    if (name.startsWith(e + '-')) return name.slice(e.length + 1);
+  }
+  return name;
+}
+
+async function setTicketStatus(channel, statusKey) {
+  const emoji = STATUS_EMOJI[statusKey];
+  if (!emoji) return;
+  const ticket = activeTickets.get(channel.id);
+  if (ticket) ticket.status = statusKey;
+  const baseName = stripStatusPrefix(channel.name);
+  const newName = `${emoji}-${baseName}`;
+  if (channel.name !== newName) {
+    await channel.setName(newName).catch(() => {});
+  }
+}
 const TAGS = {
   greet:    (name) => `*🌺 Aloha!*\n\nHello, my name is **${name}**. I will be assisting you today.`,
   escalate: ()     => `*⬆️ Escalation Notice*\n\nWe are calling in a higher rank to assist with your ticket. Please hold tight while we get someone to help you.`,
@@ -79,6 +256,7 @@ const commands = [
   new SlashCommandBuilder().setName('close').setDescription('Close this support ticket'),
   new SlashCommandBuilder().setName('closerequest').setDescription('Request to close this ticket'),
   new SlashCommandBuilder().setName('claim').setDescription('Claim this support ticket'),
+  new SlashCommandBuilder().setName('priority').setDescription('Toggle priority/urgent status on this ticket'),
   new SlashCommandBuilder()
     .setName('add')
     .setDescription('Add a user to this ticket')
@@ -102,17 +280,57 @@ const commands = [
           { name: 'thanks', value: 'thanks' },
           { name: 'follow', value: 'follow' },
         )),
+  new SlashCommandBuilder()
+    .setName('checkmessages')
+    .setDescription('Check a user\'s message count and rank')
+    .addUserOption(opt => opt.setName('user').setDescription('User to check (defaults to you)').setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('addmessages')
+    .setDescription('Manually add to a user\'s message count (restricted)')
+    .addUserOption(opt => opt.setName('user').setDescription('User to update').setRequired(true))
+    .addIntegerOption(opt => opt.setName('amount').setDescription('Amount of messages to add').setRequired(true)),
 ].map(cmd => cmd.toJSON());
 
 // ─── READY ────────────────────────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`✅ Solvani Utilities is online as ${client.user.tag}`);
+  try {
+    await initDb();
+  } catch (err) {
+    console.error('❌ Failed to initialize database:', err);
+  }
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
   try {
     await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
     console.log('✅ Slash commands registered.');
   } catch (err) {
     console.error('❌ Failed to register commands:', err);
+  }
+});
+
+// ─── MESSAGE LEVELING ─────────────────────────────────────────────────────────
+client.on('messageCreate', async (message) => {
+  try {
+    if (message.author.bot || !message.guild) return;
+
+    const now = Date.now();
+    const last = messageCooldowns.get(message.author.id) ?? 0;
+    if (now - last < LEVEL_CONFIG.COOLDOWN_MS) return;
+    messageCooldowns.set(message.author.id, now);
+
+    const userData = await incrementMessageCount(message.author.id, 1);
+    await checkAndApplyTierUp(message.member, userData);
+  } catch (err) {
+    console.error('❌ messageCreate leveling error:', err);
+  }
+});
+
+// ─── REJOIN ROLE REASSIGNMENT ─────────────────────────────────────────────────
+client.on('guildMemberAdd', async (member) => {
+  try {
+    await reassignTierOnRejoin(member);
+  } catch (err) {
+    console.error('❌ guildMemberAdd reassignment error:', err);
   }
 });
 
@@ -245,7 +463,7 @@ client.on('interactionCreate', async (interaction) => {
 
     await interaction.deferReply({ ephemeral: true });
 
-    const channelName = `${member.user.username}-${type}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const channelName = `${STATUS_EMOJI.open}-${member.user.username}-${type}`.toLowerCase().replace(/[^a-z0-9-🟢]/g, '-');
 
     const permOverwrites = [
       { id: guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
@@ -262,7 +480,7 @@ client.on('interactionCreate', async (interaction) => {
       permissionOverwrites: permOverwrites,
     });
 
-    activeTickets.set(channel.id, { userId: member.id, type: ticketType.label, claimedBy: null, openedAt: Date.now() });
+    activeTickets.set(channel.id, { userId: member.id, type: ticketType.label, claimedBy: null, openedAt: Date.now(), status: 'open' });
 
     const openEmbed = new EmbedBuilder()
       .setColor(ticketType.color)
@@ -299,6 +517,7 @@ client.on('interactionCreate', async (interaction) => {
     if (!hasSupportRole(interaction.member)) return interaction.reply({ content: '❌ You do not have permission.', ephemeral: true });
 
     ticket.claimedBy = interaction.member.id;
+    await setTicketStatus(ticketChannel, 'claimed');
     await interaction.reply({
       embeds: [new EmbedBuilder().setColor(CONFIG.COLOR).setDescription(`✋ This ticket has been claimed by **${interaction.member.displayName}**.`).setTimestamp()]
     });
@@ -356,9 +575,26 @@ client.on('interactionCreate', async (interaction) => {
     if (!hasSupportRole(member)) return interaction.reply({ content: '❌ You do not have permission.', ephemeral: true });
     const ticket = activeTickets.get(channel.id);
     ticket.claimedBy = member.id;
+    await setTicketStatus(channel, 'claimed');
     await interaction.reply({
       embeds: [new EmbedBuilder().setColor(CONFIG.COLOR).setDescription(`✋ This ticket has been claimed by **${member.displayName}**.`).setTimestamp()]
     });
+  }
+
+  // /priority
+  if (commandName === 'priority') {
+    if (!isTicketChannel(channel)) return interaction.reply({ content: '❌ This is not a ticket channel.', ephemeral: true });
+    if (!hasSupportRole(member)) return interaction.reply({ content: '❌ You do not have permission.', ephemeral: true });
+    const ticket = activeTickets.get(channel.id);
+    const isPriority = ticket.status === 'priority';
+    await setTicketStatus(channel, isPriority ? (ticket.claimedBy ? 'claimed' : 'open') : 'priority');
+    const embed = new EmbedBuilder()
+      .setColor(isPriority ? CONFIG.COLOR : 0xE74C3C)
+      .setDescription(isPriority
+        ? `🟢 Priority removed by **${member.displayName}**.`
+        : `🔴 **This ticket has been marked as priority/urgent** by **${member.displayName}**.`)
+      .setTimestamp();
+    await interaction.reply({ embeds: [embed] });
   }
 
   // /add
@@ -392,6 +628,40 @@ client.on('interactionCreate', async (interaction) => {
       .setFooter({ text: `${member.displayName} • Solvani Support` })
       .setTimestamp();
     await interaction.reply({ embeds: [embed] });
+  }
+
+  // /checkmessages
+  if (commandName === 'checkmessages') {
+    const target = interaction.options.getUser('user') ?? interaction.user;
+    const userData = await getUserData(target.id);
+    const tier = getTierForCount(userData.message_count);
+    const nextTier = TIERS[getTierIndex(tier.key) + 1];
+
+    const embed = new EmbedBuilder()
+      .setColor(0xF4C542)
+      .setTitle(`📊 ${target.username}'s Stats`)
+      .addFields(
+        { name: '💬 Messages', value: `${userData.message_count}`, inline: true },
+        { name: '🏅 Current Tier', value: tier.title.replace(/^.*— /, '').replace(' In The House', ''), inline: true },
+        { name: '⬆️ Next Tier', value: nextTier ? `${nextTier.threshold - userData.message_count} messages until **${nextTier.title.replace(/^.*— /, '').replace(' In The House', '')}**` : '🎉 Max tier reached!', inline: false },
+      )
+      .setTimestamp();
+    await interaction.reply({ embeds: [embed] });
+  }
+
+  // /addmessages
+  if (commandName === 'addmessages') {
+    if (!member.roles.cache.has(LEVEL_CONFIG.ADD_MESSAGES_ROLE) && !hasAdminRole(member)) {
+      return interaction.reply({ content: '❌ You do not have permission to use this command.', ephemeral: true });
+    }
+    const target = interaction.options.getUser('user');
+    const amount = interaction.options.getInteger('amount');
+    const targetMember = await guild.members.fetch(target.id).catch(() => null);
+
+    const userData = await incrementMessageCount(target.id, amount);
+    if (targetMember) await checkAndApplyTierUp(targetMember, userData);
+
+    await interaction.reply({ content: `✅ Added **${amount}** messages to **${target.username}**. New total: **${userData.message_count}**.` });
   }
 
  } catch (err) {
